@@ -5,10 +5,10 @@ Same serial + pygame loop as draw.py. When you release the pen button, the
 current canvas is preprocessed (bbox crop → 64×64) and classified with
 model_best.pt. Predictions print to the terminal and accumulate in a session list.
 
-After GEMINI_IDLE_SECONDS with the pen up and no new word, accumulated words are
-sent to Gemini to form one natural sentence; that sentence is printed and spoken
-(macOS: `say`). Set `GEMINI_API_KEY` in a `.env` file next to this script, or export
-`GEMINI_API_KEY` / `GOOGLE_API_KEY` in the environment.
+After GROQ_IDLE_SECONDS with the pen up and no new word, accumulated words are
+sent to Groq (Llama) to form one natural sentence; that sentence is printed and
+spoken via Groq TTS (Orpheus). Set `GROQ_API_KEY` in a `.env` file next to this
+script, or export `GROQ_API_KEY` in the environment.
 
 Run:  python3 infer.py  [optional_serial_port]
 
@@ -83,7 +83,7 @@ def find_port() -> str:
 
 # ── Serial / UI (same as draw.py) ────────────────────────────────────────────
 
-SERIAL_PORT = "/dev/cu.usbmodem1101"
+SERIAL_PORT = "/dev/cu.usbmodem2101"
 BAUD = 115200
 WIDTH, HEIGHT = 900, 650
 BG_COLOR = (15, 15, 20)
@@ -109,13 +109,15 @@ Y_SENSITIVITY = 1.38
 PRINT_SERIAL_DATA = False
 SERIAL_PRINT_EVERY = 10
 
-# ── Gemini + TTS (after pause with pen up) ──────────────────────────────────
-# Seconds after the last CNN word (pen release) before we flush to Gemini + TTS.
-GEMINI_IDLE_SECONDS = 3.0
-GEMINI_MODEL = "gemini-2.0-flash"
+# ── Groq LLM + TTS (after pause with pen up) ────────────────────────────────
+# Seconds after the last CNN word (pen release) before we flush to Groq + TTS.
+GROQ_IDLE_SECONDS = 2.0
+GROQ_LLM_MODEL = "openai/gpt-oss-20b"
+GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
+GROQ_TTS_VOICE = "troy"
 # Optional override (prefer `.env` or the environment — do not commit real keys).
-GEMINI_API_KEY = ""
-GEMINI_API_KEY_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+GROQ_API_KEY = ""
+GROQ_API_KEY_ENV = ("GROQ_API_KEY",)
 
 _env_file_loaded = False
 
@@ -185,9 +187,7 @@ def preprocess(img: Image.Image, size: int = IMG_SIZE) -> Image.Image:
 
 
 def build_model(num_classes: int) -> nn.Module:
-    model = torchvision.models.mobilenet_v2(
-        weights=torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V1
-    )
+    model = torchvision.models.mobilenet_v2(weights=None)
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, num_classes)
     return model
@@ -241,73 +241,89 @@ def predict_canvas(canvas_surface: pygame.Surface) -> tuple[str, float]:
     return predict_pil(pil)
 
 
-def _gemini_api_key() -> str | None:
+def _groq_api_key() -> str | None:
     _load_project_env_file()
-    file_key = str(GEMINI_API_KEY).strip()
+    file_key = str(GROQ_API_KEY).strip()
     if file_key:
         return file_key
-    for name in GEMINI_API_KEY_ENV:
+    for name in GROQ_API_KEY_ENV:
         v = os.environ.get(name, "").strip()
         if v:
             return v
     return None
 
 
-def naturalize_with_gemini(words: list[str]) -> str | None:
+def naturalize_with_groq(words: list[str]) -> str | None:
     """Turn ordered CNN tokens into one natural sentence. Returns None on failure."""
-    key = _gemini_api_key()
+    key = _groq_api_key()
     if not key:
         print(
-            "[gemini] No API key — add GEMINI_API_KEY to `.env`, export "
-            "GEMINI_API_KEY / GOOGLE_API_KEY, or set GEMINI_API_KEY in infer.py. Skipping.",
+            "[groq] No API key — add GROQ_API_KEY to `.env`, export "
+            "GROQ_API_KEY, or set GROQ_API_KEY in infer.py. Skipping.",
             flush=True,
         )
         return None
     if not words:
         return None
     try:
-        import google.generativeai as genai
+        from groq import Groq
     except ImportError:
-        print("[gemini] Install: pip install google-generativeai", flush=True)
+        print("[groq] Install: pip install groq", flush=True)
         return None
-    genai.configure(api_key=key)
-    mdl = genai.GenerativeModel(GEMINI_MODEL)
+    client = Groq(api_key="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")
     joined = " ".join(words)
-    prompt = (
-        "You are interpreting words air-written one at a time by a person using a "
-        "motion-sensing pen. The classifier recognised these words in sequence:\n"
-        f"  {joined}\n\n"
-        "Write exactly ONE fluent, natural English sentence the person most likely intended.\n\n"
-        "Rules:\n"
-        "• Speak in the FIRST PERSON — the writer is 'I' / 'my' / 'me'.\n"
-        "• Use every recognised word; only add short function words that are strictly "
-        "necessary (articles, prepositions, 'am', 'is', 'are', 'feel', etc.).\n"
-        "• If the words express a feeling or body state (tired, happy, hungry, sad, "
-        "bored, sick …) form: 'I am feeling [word].' or 'I feel [word].' — do NOT just "
-        "repeat the raw word.\n"
-        "• For introductions use: 'Hi, my name is [name].' style.\n"
-        "• Capitalise the first letter; end with appropriate punctuation (. or ! or ?).\n"
-        "• Do NOT add extra commentary, quotes, or explanation — output the sentence only.\n\n"
-        "Examples (word sequence → sentence):\n"
-        "  hi name affan        → Hi, my name is Affan.\n"
-        "  hi my name is affan  → Hi, my name is Affan!\n"
-        "  this is my name      → This is my name.\n"
-        "  I tired              → I am feeling tired.\n"
-        "  we hi                → We say hi!\n"
-        "  my name affan        → My name is Affan.\n"
-        "  I this               → I am doing this.\n"
-        "  hi affan             → Hi, I'm Affan!\n\n"
-        "Now write the sentence for the sequence above:"
-    )
+    prompt = f"""you are reconstructing a single intended sentence from a sequence of words detected from air-written input.
+
+input word sequence:
+{joined}
+
+objective:
+generate exactly one coherent, natural-sounding english sentence that best represents the writer’s intended meaning.
+
+hard constraints:
+
+output only one sentence. no explanations, no quotes, no meta text.
+sentence must be in first person where applicable using “i / me / my”.
+all input words must be used exactly once, unless grammatical normalization is required (e.g. tense, capitalization).
+you may insert minimal functional words only (articles, auxiliary verbs, prepositions) strictly to ensure grammatical correctness. do not add new semantic content.
+
+semantic normalization rules:
+
+if input expresses emotions or physical states (e.g. tired, happy, hungry, sick): convert to
+→ “i am feeling [word]” or “i feel [word]”
+if input resembles an introduction (e.g. name present): convert to
+→ “hi, my name is [name].” or equivalent natural variant
+if input is structurally incomplete or ambiguous, infer the most probable natural intent while preserving all words
+
+formatting rules:
+
+capitalize first letter of the sentence
+end with appropriate punctuation (. ! ?) based on tone
+
+few-shot calibration:
+hi name affan → hi, my name is affan.
+i tired → i am feeling tired.
+my name affan → my name is affan.
+hi affan → hi, i’m affan!
+
+final instruction:
+produce the sentence now."""
     try:
-        resp = mdl.generate_content(prompt)
-        text = (resp.text or "").strip()
-        # Strip any accidental surrounding quotes the model may add
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that forms natural sentences from air-written words."},
+                {"role": "user", "content": prompt},
+            ],
+            model=GROQ_LLM_MODEL,
+            temperature=0.5,
+            max_completion_tokens=128,
+        )
+        text = (chat_completion.choices[0].message.content or "").strip()
         if len(text) >= 2 and text[0] in ('"', "'") and text[-1] in ('"', "'"):
             text = text[1:-1].strip()
         return text or None
     except Exception as exc:
-        print(f"[gemini] Error: {exc}", flush=True)
+        print(f"[groq] Error: {exc}", flush=True)
         return None
 
 
@@ -315,6 +331,30 @@ def speak_sentence(text: str) -> None:
     text = text.strip()
     if not text:
         return
+    key = _groq_api_key()
+    if key:
+        try:
+            from groq import Groq
+            client = Groq(api_key="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")
+            response = client.audio.speech.create(
+                model=GROQ_TTS_MODEL,
+                voice=GROQ_TTS_VOICE,
+                input=text,
+                response_format="wav",
+            )
+            tmp_path = Path(__file__).resolve().parent / ".groq_tts_tmp.wav"
+            response.write_to_file(str(tmp_path))
+            if sys.platform == "darwin":
+                subprocess.run(["afplay", str(tmp_path)], check=False)
+            else:
+                subprocess.run(["aplay", str(tmp_path)], check=False)
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            return
+        except Exception as exc:
+            print(f"[groq-tts] Error: {exc}", flush=True)
     if sys.platform == "darwin":
         subprocess.run(["say", text], check=False)
         return
@@ -328,14 +368,14 @@ def speak_sentence(text: str) -> None:
         print(f"[tts] No speech (macOS has `say`; else install pyttsx3): {exc}", flush=True)
 
 
-def flush_phrase_to_gemini_and_tts(words: list[str]) -> str:
+def flush_phrase_to_groq_and_tts(words: list[str]) -> str:
     """
     Naturalize words into a sentence, speak it, and return the sentence string.
-    Falls back to raw joined words when Gemini is unavailable.
+    Falls back to raw joined words when Groq is unavailable.
     """
     if not words:
         return ""
-    final = naturalize_with_gemini(words)
+    final = naturalize_with_groq(words)
     if final:
         print(f"\n>>> FINAL: {final}\n", flush=True)
         speak_sentence(final)
@@ -375,8 +415,23 @@ def main() -> None:
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("AIRTALK – Inference")
-    font_big = pygame.font.SysFont("monospace", 18, bold=True)
-    font_hint = pygame.font.SysFont("monospace", 14)
+
+    class _DummyFont:
+        @staticmethod
+        def render(text, antialias, color):
+            surf = pygame.Surface((1, 1), pygame.SRCALPHA)
+            return surf
+
+    try:
+        font_big = pygame.font.SysFont("monospace", 18, bold=True)
+        font_hint = pygame.font.SysFont("monospace", 14)
+        font_sentence = pygame.font.SysFont("monospace", 26, bold=True)
+    except (NotImplementedError, ImportError):
+        print("[warn] pygame.font unavailable; HUD text disabled", flush=True)
+        font_big = _DummyFont()
+        font_hint = _DummyFont()
+        font_sentence = _DummyFont()
+
     clock = pygame.time.Clock()
 
     canvas = pygame.Surface((WIDTH, HEIGHT))
@@ -392,9 +447,9 @@ def main() -> None:
     accel_gain = ACCEL_GAIN
     status_msg = "Waiting for READY or first IMU line …"
     predictions: list[str] = []
-    pending_gemini_words: list[str] = []
+    pending_groq_words: list[str] = []
     last_cnn_word_mono: float | None = None
-    last_sentence: str = ""          # last Gemini-generated sentence for on-screen display
+    last_sentence: str = ""          # last Groq-generated sentence for on-screen display
     sentence_display_until: float = 0.0   # monotonic time until we keep showing the sentence
 
     ready = False
@@ -411,6 +466,10 @@ def main() -> None:
                     running = False
                 elif event.key == pygame.K_c:
                     canvas.fill(BG_COLOR)
+                    predictions.clear()
+                    pending_groq_words.clear()
+                    last_sentence = ""
+                    sentence_display_until = 0.0
                     status_msg = "Canvas cleared"
                 elif event.key == pygame.K_r:
                     cx, cy = WIDTH // 2, HEIGHT // 2
@@ -507,7 +566,7 @@ def main() -> None:
                 if not pen_down and prev_pen_down and ready:
                     label, conf = predict_canvas(canvas)
                     predictions.append(label)
-                    pending_gemini_words.append(label)
+                    pending_groq_words.append(label)
                     last_cnn_word_mono = time.monotonic()
                     print(f"\n>>> PREDICTION: '{label}'  ({conf:.1%} confidence)", flush=True)
                     print(f"    Session so far: {predictions}\n", flush=True)
@@ -592,12 +651,12 @@ def main() -> None:
                 if ready and not inferred_this_line:
                     status_msg = "PEN UP  |  Press button to draw"
 
-        idle_sec = max(0.1, float(GEMINI_IDLE_SECONDS))
-        if pending_gemini_words and not pen_down and last_cnn_word_mono is not None:
+        idle_sec = max(0.1, float(GROQ_IDLE_SECONDS))
+        if pending_groq_words and not pen_down and last_cnn_word_mono is not None:
             elapsed = time.monotonic() - last_cnn_word_mono
             if elapsed >= idle_sec:
-                sentence = flush_phrase_to_gemini_and_tts(pending_gemini_words[:])
-                pending_gemini_words.clear()
+                sentence = flush_phrase_to_groq_and_tts(pending_groq_words[:])
+                pending_groq_words.clear()
                 last_cnn_word_mono = None
                 if sentence:
                     last_sentence = sentence
@@ -607,15 +666,14 @@ def main() -> None:
                     status_msg = "Phrase finalized — keep writing"
             else:
                 left = idle_sec - elapsed
-                words_preview = " ".join(pending_gemini_words)
+                words_preview = " ".join(pending_groq_words)
                 status_msg = f"[{words_preview}] → sentence in {left:.1f}s…"
 
         screen.blit(canvas, (0, 0))
 
-        # ── Sentence overlay — show for 8 s after Gemini returns ─────────────
+        # ── Sentence overlay — show for 8 s after Groq returns ─────────────
         now = time.monotonic()
         if last_sentence and now < sentence_display_until:
-            font_sentence = pygame.font.SysFont("monospace", 26, bold=True)
             # Semi-transparent dark backdrop
             overlay = pygame.Surface((WIDTH, 80), pygame.SRCALPHA)
             overlay.fill((10, 10, 18, 210))
@@ -646,7 +704,7 @@ def main() -> None:
         hud = font_big.render(status_msg, True, (220, 220, 220))
         screen.blit(hud, (10, 8))
         hints = font_hint.render(
-            f"release=word  pause{GEMINI_IDLE_SECONDS:g}s=sentence  C=clear  R=reset  S=save  "
+            f"release=word  pause{GROQ_IDLE_SECONDS:g}s=sentence  C=clear  R=reset  S=save  "
             f"+/-=rot({scale})  [/]=trans({accel_gain:.0f})  ESC=quit",
             True,
             (120, 120, 140),
@@ -658,9 +716,9 @@ def main() -> None:
 
     ser.close()
     pygame.quit()
-    if pending_gemini_words:
+    if pending_groq_words:
         print("[infer] Flushing unfinished phrase before exit …", flush=True)
-        flush_phrase_to_gemini_and_tts(pending_gemini_words[:])  # speak on exit too
+        flush_phrase_to_groq_and_tts(pending_groq_words[:])  # speak on exit too
     if predictions:
         print(f"\n[infer] Session CNN words ({len(predictions)}): {predictions}", flush=True)
     print("Bye!", flush=True)
