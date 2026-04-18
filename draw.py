@@ -3,12 +3,11 @@ AIRTALK – Air Writing Visualizer
 ---------------------------------
 Reads IMU + button data from the Arduino over serial and draws on screen.
 
-Serial format (100 Hz):  rotX*100, rotY*100, linX*100, linY*100, penDown
-  rotX = gyro Z  (left/right rotation, rad/s * 100)
-  rotY = gyro X  (up/down   rotation, rad/s * 100)
-  linX = accel X (left/right linear,  m/s² * 100)
-  linY = accel Y (up/down   linear,   m/s² * 100)
+Serial format (100 Hz):
+  rotX*100, rotY*100, linX*100, linY*100, penDown, accelBiasZ*100
+  rotX, rotY, linX, linY = motion (same scaling as before; m/s² and rad/s * 100)
   penDown = 1 (button pressed) | 0 (pen lifted)
+  accelBiasZ = averaged raw accel Z at calibration (m/s² * 100), used on the Python side
 
 Controls
 --------
@@ -21,6 +20,9 @@ Controls
 
 import sys
 import glob
+import math
+from datetime import datetime, timezone
+from pathlib import Path
 import pygame
 
 
@@ -91,12 +93,39 @@ LINE_WIDTH  = 3
 DT          = 0.01              # matches Arduino 10 ms loop
 DEAD_ZONE   = 0.03             # rad/s – ignore tiny gyro noise
 
-# Gyro contributes this fraction; linear accel contributes the rest.
-GYRO_WEIGHT = 0.85
-ACCEL_WEIGHT = 1.0 - GYRO_WEIGHT
+# Gyro drives rotation-based drawing; accel is integrated into a damped
+# velocity so sustained hand translation also moves the cursor.
+GYRO_WEIGHT = 1.0
+
+# Accel-velocity integration: lin_{x,y} (m/s²) → velocity (px/s) → position.
+# Damping kills drift when the hand is still; gain converts m/s into pixels/s.
+VEL_DAMPING       = 0.90     # per sample (~100 Hz). 1.0 = no damping, 0 = off.
+ACCEL_GAIN        = 220.0    # pixels per (m/s). Tune with [ and ] keys.
+ACCEL_DEAD_ZONE   = 0.15     # m/s² – ignore tiny accel noise at rest
+# High-pass filter on lin_{x,y}: a slow low-pass tracks the *current* gravity
+# leakage in the body frame (which changes whenever the pen is tilted away
+# from the calibration pose), and we subtract it.  Only the fast transients
+# from real hand translation survive and get integrated into velocity.
+#   α near 1 = slow adaption (big time constant, τ ≈ DT / (1-α))
+#   α = 0.985 @ 100Hz → τ ≈ 0.67 s
+GRAVITY           = 9.81    # m/s² — normalises accel relative to calibration
+GRAV_LPF_ALPHA    = 0.985
+# While the pen is rotating, gravity leakage is changing rapidly.  Snap the
+# low-pass to the current sample so the high-pass output stays ~0 and no
+# phantom velocity builds up; also bleed any existing velocity.
+ROT_GATE          = 0.25     # rad/s – above this we consider the pen "rotating"
+ROT_GATE_DAMPING  = 0.70     # velocity decay while rotating
+
+CAPTURES_DIR = Path(__file__).resolve().parent / "captures"
 
 # Pixels per (rad/s · second) of movement – tune with +/- keys
 DEFAULT_SCALE = 280
+
+# Independent per-axis sensitivity multipliers.  X defaults to 1.0 (no
+# extra scaling); Y compensates for screen aspect ratio and any physical
+# axis difference.  Raise X if left/right strokes feel too short.
+X_SENSITIVITY = 1.5    # tune independently of Y
+Y_SENSITIVITY = 1.38   # ≈ WIDTH / HEIGHT (900/650) as a starting point
 
 # Echo serial to the terminal (watch for READY, then IMU lines). 1 = every sample (~100/s).
 PRINT_SERIAL_DATA = True
@@ -142,14 +171,20 @@ def main():
 
     cx, cy = WIDTH // 2, HEIGHT // 2   # cursor position
     px, py = cx, cy                    # previous cursor position
+    vx, vy = 0.0, 0.0                  # accel-integrated velocity (px/s)
+    grav_lp_x, grav_lp_y = 0.0, 0.0    # low-pass est. of gravity leakage into lin
     pen_down = False
+    prev_pen_down = False
     scale = DEFAULT_SCALE
+    accel_gain = ACCEL_GAIN
     status_msg = "Waiting for READY or first IMU line …"
 
     # Do not reset_input_buffer(): if the board already sent READY, flushing would
     # leave us stuck forever with no "READY" substring in new data.
     ready = False
     _serial_print_count = 0
+    # Updated from serial when the 6th field is present (~gravity at rest during cal).
+    accel_bias_z = 9.81
 
     running = True
     while running:
@@ -166,13 +201,31 @@ def main():
                 elif event.key == pygame.K_r:
                     cx, cy = WIDTH // 2, HEIGHT // 2
                     px, py = cx, cy
-                    status_msg = "Cursor reset to centre"
+                    vx, vy = 0.0, 0.0
+                    grav_lp_x, grav_lp_y = 0.0, 0.0
+                    ready = False
+                    ser.write(b'R')
+                    status_msg = "Calibrating… hold pen still and flat!"
                 elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     scale = min(scale + 20, 600)
                     status_msg = f"Sensitivity: {scale}"
                 elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     scale = max(scale - 20, 40)
                     status_msg = f"Sensitivity: {scale}"
+                elif event.key == pygame.K_RIGHTBRACKET:
+                    accel_gain = min(accel_gain + 20, 1000)
+                    status_msg = f"Translation gain: {accel_gain:.0f}"
+                elif event.key == pygame.K_LEFTBRACKET:
+                    accel_gain = max(accel_gain - 20, 0)
+                    status_msg = f"Translation gain: {accel_gain:.0f}"
+                elif event.key == pygame.K_s:
+                    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+                    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S%fZ")[:-3]
+                    save_path = CAPTURES_DIR / f"capture_{stamp}.png"
+                    pygame.image.save(canvas, str(save_path))
+                    canvas.fill(BG_COLOR)
+                    status_msg = f"Saved + cleared: captures/capture_{stamp}.png"
+                    print(f"[capture] Saved to {save_path}", flush=True)
 
         # ── Read serial ──────────────────────────────────────────────────────
         # Drain every full line already in the OS buffer (non-blocking).
@@ -191,6 +244,9 @@ def main():
             if not ready:
                 if raw and PRINT_SERIAL_DATA:
                     print(f"[serial] {raw}", flush=True)
+                if "CALIBRATING" in raw:
+                    status_msg = "Calibrating… hold pen still and flat!"
+                    continue
                 if "READY" in raw:
                     ready = True
                     status_msg = "PEN UP  |  Press button to draw"
@@ -199,13 +255,15 @@ def main():
                     continue
                 # Missed READY (e.g. opened serial after boot) — accept first CSV row.
                 parts_probe = [p.strip() for p in raw.split(",")]
-                if len(parts_probe) == 5:
+                if len(parts_probe) in (5, 6):
                     try:
                         float(parts_probe[0])
                         float(parts_probe[1])
                         float(parts_probe[2])
                         float(parts_probe[3])
                         _ = int(parts_probe[4])
+                        if len(parts_probe) == 6:
+                            float(parts_probe[5])
                     except ValueError:
                         continue
                     ready = True
@@ -216,16 +274,26 @@ def main():
                     continue
 
             parts = [p.strip() for p in raw.split(",")]
-            if len(parts) != 5:
+            if len(parts) not in (5, 6):
                 if PRINT_SERIAL_DATA and raw:
                     print(f"[serial skip] bad line ({len(parts)} fields): {raw!r}", flush=True)
                 continue
             try:
-                rot_x   = float(parts[0]) / 100.0   # gyro Z  rad/s
-                rot_y   = float(parts[1]) / 100.0   # gyro X  rad/s
-                lin_x   = float(parts[2]) / 100.0   # accel X m/s²
-                lin_y   = float(parts[3]) / 100.0   # accel Y m/s²
+                s = 100.0  # Arduino sends rad/s and m/s² scaled by 100
+                rot_x = -float(parts[0]) / s
+                rot_y = -float(parts[1]) / s
+                lin_x = float(parts[2]) / 100.0
+                lin_y = float(parts[3]) / 100.0
                 pen_down = int(parts[4]) == 1
+                if pen_down and not prev_pen_down:
+                    canvas.fill(BG_COLOR)
+                    cx, cy = WIDTH // 2, HEIGHT // 2
+                    px, py = cx, cy
+                    vx, vy = 0.0, 0.0
+                    grav_lp_x, grav_lp_y = 0.0, 0.0
+                prev_pen_down = pen_down
+                if len(parts) == 6:
+                    accel_bias_z = float(parts[5]) / s
             except ValueError:
                 if PRINT_SERIAL_DATA and raw:
                     print(f"[serial skip] parse error: {raw!r}", flush=True)
@@ -237,7 +305,8 @@ def main():
                 if _serial_print_count % every == 0:
                     print(
                         f"rot=({rot_x:+.4f},{rot_y:+.4f}) "
-                        f"lin=({lin_x:+.4f},{lin_y:+.4f}) pen={int(pen_down)}",
+                        f"lin=({lin_x:+.4f},{lin_y:+.4f}) "
+                        f"pen={int(pen_down)} bias_z={accel_bias_z:+.3f}",
                         flush=True,
                     )
 
@@ -247,13 +316,65 @@ def main():
             if abs(rot_y) < DEAD_ZONE:
                 rot_y = 0.0
 
-            # Sensor fusion: gyro gives smooth curves, accel helps straight lines
-            move_x = (rot_x * GYRO_WEIGHT + lin_x * ACCEL_WEIGHT * 0.05) * scale * DT
-            move_y = (rot_y * GYRO_WEIGHT + lin_y * ACCEL_WEIGHT * 0.05) * scale * DT
+            # Rotation normalization: prevent diagonal moves from compounding to
+            # sqrt(2)x the speed of a single-axis move.  Scale the vector so its
+            # magnitude equals the dominant (peak) component — pure horizontal or
+            # vertical strokes are unchanged; a 45° diagonal is reduced by 1/sqrt(2).
+            rot_mag = math.hypot(rot_x, rot_y)
+            if rot_mag > 1e-6:
+                peak = max(abs(rot_x), abs(rot_y))
+                rot_x = rot_x * peak / rot_mag
+                rot_y = rot_y * peak / rot_mag
+
+            # Use calibration Z bias (~|g| when pen was flat) to normalize accel contribution.
+            grav_ref = max(abs(accel_bias_z), 0.5)
+            accel_norm = GRAVITY / grav_ref
+
+            # Normalise accel scaling relative to calibration gravity.
+            raw_ax = lin_x * accel_norm
+            raw_ay = lin_y * accel_norm
+
+            # --- Gravity-leakage estimator (complementary / high-pass) --------
+            # lin_{x,y} is NOT truly linear accel once the pen is tilted; it
+            # contains a slowly-varying DC term = (R(θ) - R(0)) g .  Track that
+            # DC with a low-pass filter and subtract it to recover real motion.
+            rotating = max(abs(rot_x), abs(rot_y)) > ROT_GATE
+            if rotating:
+                # Pose is changing fast → snap the low-pass to "now" so the
+                # high-pass output is ~0 and no phantom velocity is produced.
+                grav_lp_x = raw_ax
+                grav_lp_y = raw_ay
+            else:
+                grav_lp_x = GRAV_LPF_ALPHA * grav_lp_x + (1 - GRAV_LPF_ALPHA) * raw_ax
+                grav_lp_y = GRAV_LPF_ALPHA * grav_lp_y + (1 - GRAV_LPF_ALPHA) * raw_ay
+
+            ax = raw_ax - grav_lp_x   # true linear accel in body X
+            ay = raw_ay - grav_lp_y   # true linear accel in body Y
+
+            # Dead-zone the residual so idle noise doesn't integrate into drift.
+            if abs(ax) < ACCEL_DEAD_ZONE: ax = 0.0
+            if abs(ay) < ACCEL_DEAD_ZONE: ay = 0.0
+
+            if rotating:
+                # While rotating, don't add new velocity — let existing bleed off.
+                vx *= ROT_GATE_DAMPING
+                vy *= ROT_GATE_DAMPING
+            else:
+                # a (m/s²) * DT (s) = Δv (m/s); scale by ACCEL_GAIN (px per m/s).
+                vx = vx * VEL_DAMPING + ax * DT * accel_gain
+                vy = vy * VEL_DAMPING + ay * DT * accel_gain
+
+            # Snap to zero when the hand is essentially still.
+            if ax == 0.0 and abs(vx) < 0.5: vx = 0.0
+            if ay == 0.0 and abs(vy) < 0.5: vy = 0.0
+
+            # Gyro rotation drives curves; integrated velocity drives translation.
+            move_x = (rot_x * GYRO_WEIGHT * scale * DT + vx * DT) * X_SENSITIVITY
+            move_y = (rot_y * GYRO_WEIGHT * scale * DT + vy * DT) * Y_SENSITIVITY
 
             px, py = cx, cy
             cx = max(0, min(WIDTH  - 1, cx + move_x))
-            cy = max(0, min(HEIGHT - 1, cy - move_y))   # screen Y is flipped
+            cy = max(0, min(HEIGHT - 1, cy + move_y))   # screen Y is flipped
 
             if pen_down and ready:
                 pygame.draw.line(canvas, INK_COLOR,
@@ -277,7 +398,7 @@ def main():
         hud = font_big.render(status_msg, True, (220, 220, 220))
         screen.blit(hud, (10, 8))
         hints = font_hint.render(
-            f"C=clear  R=reset  +/-=sensitivity({scale})  ESC=quit",
+            f"C=clear  R=reset  S=save  +/-=rot({scale})  [/]=trans({accel_gain:.0f})  ESC=quit",
             True, (120, 120, 140)
         )
         screen.blit(hints, (WIDTH - hints.get_width() - 10, 10))
