@@ -1,0 +1,3 @@
+pygame>=2.5.0
+# Use pyserial only — do NOT `pip install serial` (different, incompatible package).
+pyserial>=3.5
