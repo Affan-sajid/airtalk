@@ -95,6 +95,7 @@ SERIAL_PRINT_EVERY = 10
 # ── Gemini LLM + TTS (after pause with pen up) ────────────────────────────────
 # Seconds after the last CNN word (pen release) before we flush to Gemini + TTS.
 LLM_IDLE_SECONDS = 2.0
+LLM_INTERRUPT_SECONDS = 2.0
 GEMINI_LLM_MODEL = "gemini-2.5-flash"
 # Optional override (prefer `.env` or the environment — do not commit real keys).
 GEMINI_API_KEY_ENV = ("GEMINI_API_KEY",)
@@ -476,6 +477,13 @@ def main() -> None:
                     canvas.fill(BG_COLOR)
                     status_msg = f"Saved + cleared: captures/capture_{stamp}.png"
                     print(f"[capture] Saved to {save_path}", flush=True)
+                elif event.key == pygame.K_z:
+                    if pending_llm_words:
+                        pending_llm_words.clear()
+                        predictions.clear()
+                        last_cnn_word_mono = None
+                        status_msg = "LLM-TTS Interrupted / Cleared"
+                        print("[gate] LLM-TTS call canceled by user (Z)", flush=True)
 
         while True:
             try:
@@ -638,6 +646,9 @@ def main() -> None:
                     status_msg = "PEN UP  |  Press button to draw"
 
         idle_sec = max(0.1, float(LLM_IDLE_SECONDS))
+        interrupt_sec = max(0.0, float(LLM_INTERRUPT_SECONDS))
+        total_wait = idle_sec + interrupt_sec
+
         if _llm_tts_locked:
             # Hard gate: suppress ALL idle-timer logic while a cycle is live.
             # The status is already set by the locked branch above; just keep
@@ -646,7 +657,7 @@ def main() -> None:
                 status_msg = "⟳ Processing… pipeline locked"
         elif pending_llm_words and not pen_down and last_cnn_word_mono is not None:
             elapsed = time.monotonic() - last_cnn_word_mono
-            if elapsed >= idle_sec:
+            if elapsed >= total_wait:
                 # Wrap pending_llm_words and last_cnn_word_mono in mutable
                 # containers so flush_phrase_to_llm_and_tts can hard-reset
                 # them from inside its finally block — guaranteed zero residual.
@@ -664,6 +675,11 @@ def main() -> None:
                     status_msg = f'"{sentence}"'
                 else:
                     status_msg = "Phrase finalized — keep writing"
+            elif elapsed >= idle_sec:
+                # ── Interrupt Window ──────────────────────────────────────
+                # Within this window, the user can press 'Z' to cancel.
+                left = total_wait - elapsed
+                status_msg = f"READY?  [Z] to stop  ({left:.1f}s)"
             else:
                 left = idle_sec - elapsed
                 words_preview = " ".join(pending_llm_words)
@@ -714,7 +730,7 @@ def main() -> None:
         hud = font_big.render(status_msg[:80], True, (220, 220, 220))
         screen.blit(hud, (10, 6))
         hints = font_hint.render(
-            f"release=word  pause{LLM_IDLE_SECONDS:g}s=sentence  C=clear  R=recal  S=save  ESC=quit",
+            f"word=release  pause{LLM_IDLE_SECONDS:g}s+2s=speak  Z=stop  C=clear  R=recal  S=save  ESC=quit",
             True,
             (120, 120, 140),
         )
