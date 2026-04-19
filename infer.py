@@ -120,6 +120,12 @@ GROQ_API_KEY_ENV = ("GROQ_API_KEY",)
 
 _env_file_loaded = False
 
+# ── LLM+TTS execution gate ───────────────────────────────────────────────────
+# When True the pipeline is mid-cycle.  ALL new inputs and idle-timer
+# triggers must be rejected until the cycle releases the lock.
+# This is the single source-of-truth for the locked processing state.
+_llm_tts_locked: bool = False
+
 def _load_project_env_file() -> None:
     """Load KEY=VALUE from `.env` in this directory; does not override existing os.environ."""
     global _env_file_loaded
@@ -241,7 +247,7 @@ def predict_canvas(canvas_surface: pygame.Surface) -> tuple[str, float]:
 
 def _groq_api_key() -> str | None:
     _load_project_env_file()
-    file_key = file_key = os.environ.get("GROQ_API_KEY_FILE", "").strip()
+    file_key = os.environ.get("GROQ_API_KEY_FILE", "").strip()
     if file_key:
         return file_key
     for name in GROQ_API_KEY_ENV:
@@ -252,76 +258,71 @@ def _groq_api_key() -> str | None:
 
 
 def naturalize_with_groq(words: list[str]) -> str | None:
-    """Turn ordered CNN tokens into one natural sentence. Returns None on failure."""
+    """Turn ordered CNN tokens into one natural sentence using Structured Outputs."""
     key = _groq_api_key()
-    if not key:
-        print(
-            "[groq] No API key — add GROQ_API_KEY to `.env`, export "
-            "GROQ_API_KEY, or set GROQ_API_KEY in infer.py. Skipping.",
-            flush=True,
-        )
-        return None
-    if not words:
+    if not key or not words:
         return None
     try:
         from groq import Groq
     except ImportError:
         print("[groq] Install: pip install groq", flush=True)
         return None
+
     client = Groq(api_key=key)
     joined = " ".join(words)
-    prompt = f"""you are reconstructing a single intended sentence from a sequence of words detected from air-written input.
+    system_prompt = f"""You are a helpful assistant that reconstructs a single intended sentence from air-written words.
+Input tokens: {joined}
 
-input word sequence:
-{joined}
+RULES:
+- Output ONLY the final sentence inside the JSON schema.
+- Use first person ("I / me / my") where appropriate.
+- Fix grammar (tense, caps) while keeping the original intent.
+- Example: "hi name affan" -> "Hi, my name is Affan."
+"""
 
-objective:
-generate exactly one coherent, natural-sounding english sentence that best represents the writer’s intended meaning.
-
-hard constraints:
-
-output only one sentence. no explanations, no quotes, no meta text.
-sentence must be in first person where applicable using “i / me / my”.
-all input words must be used exactly once, unless grammatical normalization is required (e.g. tense, capitalization).
-you may insert minimal functional words only (articles, auxiliary verbs, prepositions) strictly to ensure grammatical correctness. do not add new semantic content.
-
-semantic normalization rules:
-
-if input expresses emotions or physical states (e.g. tired, happy, hungry, sick): convert to
-→ “i am feeling [word]” or “i feel [word]”
-if input resembles an introduction (e.g. name present): convert to
-→ “hi, my name is [name].” or equivalent natural variant
-if input is structurally incomplete or ambiguous, infer the most probable natural intent while preserving all words
-
-formatting rules:
-
-capitalize first letter of the sentence
-end with appropriate punctuation (. ! ?) based on tone
-
-few-shot calibration:
-hi name affan → hi, my name is affan.
-i tired → i am feeling tired.
-my name affan → my name is affan.
-hi affan → hi, i’m affan!
-
-final instruction:
-produce the sentence now."""
+    print(f"[groq] LLM Request: model={GROQ_LLM_MODEL}, words='{joined}'", flush=True)
+    t0 = time.perf_counter()
     try:
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that forms natural sentences from air-written words."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Generate the sentence now."},
             ],
             model=GROQ_LLM_MODEL,
             temperature=0.5,
-            max_completion_tokens=128,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "natural_sentence",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "sentence": {"type": "string"}
+                        },
+                        "required": ["sentence"],
+                        "additionalProperties": False
+                    }
+                }
+            },
         )
-        text = (chat_completion.choices[0].message.content or "").strip()
-        if len(text) >= 2 and text[0] in ('"', "'") and text[-1] in ('"', "'"):
-            text = text[1:-1].strip()
-        return text or None
+        import json
+        content = chat_completion.choices[0].message.content
+        data = json.loads(content or "{}")
+        text = data.get("sentence", "").strip().strip('"').strip("'")
+        
+        latency = time.perf_counter() - t0
+        u = getattr(chat_completion, "usage", None)
+        usage_str = f" [P:{u.prompt_tokens} C:{u.completion_tokens}]" if u else ""
+        
+        if not text:
+            print(f"[groq] Warning: LLM returned empty content after {latency:.3f}s. Raw: {repr(content)}", flush=True)
+            return None
+
+        print(f"[groq] LLM Success in {latency:.3f}s{usage_str}: \"{text}\"", flush=True)
+        return text
     except Exception as exc:
-        print(f"[groq] Error: {exc}", flush=True)
+        print(f"[groq] LLM Error after {time.perf_counter()-t0:.3f}s: {exc}", flush=True)
         return None
 
 
@@ -331,17 +332,20 @@ def speak_sentence(text: str) -> None:
         return
     key = _groq_api_key()
     if key:
+        print(f"[groq-tts] Request: model={GROQ_TTS_MODEL}, voice={GROQ_TTS_VOICE}, text='{text}'", flush=True)
+        t0 = time.perf_counter()
         try:
             from groq import Groq
             client = Groq(api_key=key)
             response = client.audio.speech.create(
-                model=GROQ_TTS_MODEL,
-                voice=GROQ_TTS_VOICE,
-                input=text,
-                response_format="wav",
+                model=GROQ_TTS_MODEL, voice=GROQ_TTS_VOICE, input=text, response_format="wav"
             )
             tmp_path = Path(__file__).resolve().parent / ".groq_tts_tmp.wav"
             response.write_to_file(str(tmp_path))
+            
+            latency = time.perf_counter() - t0
+            print(f"[groq-tts] Success in {latency:.3f}s. Playing via afplay/aplay...", flush=True)
+
             if sys.platform == "darwin":
                 subprocess.run(["afplay", str(tmp_path)], check=False)
             else:
@@ -352,7 +356,8 @@ def speak_sentence(text: str) -> None:
                 pass
             return
         except Exception as exc:
-            print(f"[groq-tts] Error: {exc}", flush=True)
+            latency = time.perf_counter() - t0
+            print(f"[groq-tts] Error after {latency:.3f}s: {exc}", flush=True)
     if sys.platform == "darwin":
         subprocess.run(["say", text], check=False)
         return
@@ -366,23 +371,60 @@ def speak_sentence(text: str) -> None:
         print(f"[tts] No speech (macOS has `say`; else install pyttsx3): {exc}", flush=True)
 
 
-def flush_phrase_to_groq_and_tts(words: list[str]) -> str:
+def flush_phrase_to_groq_and_tts(
+    words: list[str],
+    *,
+    _pending_ref: list[str] | None = None,
+    _mono_ref: list[float | None] | None = None,
+) -> str:
     """
-    Naturalize words into a sentence, speak it, and return the sentence string.
-    Falls back to raw joined words when Groq is unavailable.
+    Isolated LLM+TTS transaction.
+
+    Execution model
+    ---------------
+    • Sets ``_llm_tts_locked = True`` before any network I/O begins.
+    • The ``finally`` block unconditionally:
+        – releases the lock
+        – hard-resets *_pending_ref* (the caller's ``pending_groq_words`` list)
+          and *_mono_ref* (a one-element list wrapping ``last_cnn_word_mono``)
+          so zero residual tokens, embeddings, or context bleed into the next cycle.
+    • No parallel or interrupt-driven execution can enter while locked — the
+      caller's hot-path checks ``_llm_tts_locked`` before appending words or
+      re-triggering the idle timer.
     """
+    global _llm_tts_locked
     if not words:
         return ""
-    final = naturalize_with_groq(words)
-    if final:
-        print(f"\n>>> FINAL: {final}\n", flush=True)
-        speak_sentence(final)
-        return final
-    else:
-        joined = " ".join(words)
-        print(f"\n>>> FINAL (raw): {joined}\n", flush=True)
-        speak_sentence(joined)
-        return joined
+
+    _llm_tts_locked = True
+    print("[gate] LLM+TTS cycle START — pipeline locked", flush=True)
+    sentence = ""
+    try:
+        final = naturalize_with_groq(words)
+        if final:
+            print(f"\n>>> FINAL: {final}\n", flush=True)
+            speak_sentence(final)
+            sentence = final
+        else:
+            joined = " ".join(words)
+            print(f"\n>>> FINAL (raw): {joined}\n", flush=True)
+            speak_sentence(joined)
+            sentence = joined
+    except Exception as exc:
+        print(f"[gate] Unhandled error in LLM+TTS cycle: {exc}", flush=True)
+    finally:
+        # ── Hard context-buffer reset ─────────────────────────────────────
+        # Wipe every mutable buffer passed in by the caller so that no
+        # residual tokens, embeddings, or partial inference data survive
+        # into the next cycle.  This runs even if an exception was raised.
+        if _pending_ref is not None:
+            _pending_ref.clear()
+        if _mono_ref is not None:
+            _mono_ref[0] = None
+        _llm_tts_locked = False
+        print("[gate] LLM+TTS cycle END — pipeline unlocked, context buffer reset", flush=True)
+
+    return sentence
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -410,27 +452,24 @@ def main() -> None:
 
     _load_infer_model()
 
-    pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("AIRTALK – Inference")
-
     class _DummyFont:
         @staticmethod
         def render(text, antialias, color):
-            surf = pygame.Surface((1, 1), pygame.SRCALPHA)
-            return surf
+            return pygame.Surface((1, 1), pygame.SRCALPHA)
 
+    pygame.init()
     try:
+        pygame.font.init()
         font_big = pygame.font.SysFont("monospace", 18, bold=True)
         font_hint = pygame.font.SysFont("monospace", 13)
         font_sentence = pygame.font.SysFont("monospace", 32, bold=True)
         font_words = pygame.font.SysFont("monospace", 28, bold=True)
-    except (NotImplementedError, ImportError):
-        print("[warn] pygame.font unavailable; HUD text disabled", flush=True)
-        font_big = _DummyFont()
-        font_hint = _DummyFont()
-        font_sentence = _DummyFont()
-        font_words = _DummyFont()
+    except Exception:
+        print("[warn] pygame.font unavailable (likely circular import in 3.14); HUD text disabled", flush=True)
+        font_big = font_hint = font_sentence = font_words = _DummyFont()
+
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("AIRTALK – Inference")
 
     clock = pygame.time.Clock()
 
@@ -566,11 +605,20 @@ def main() -> None:
                 if not pen_down and prev_pen_down and ready:
                     label, conf = predict_canvas(canvas)
                     predictions.append(label)
-                    pending_groq_words.append(label)
-                    last_cnn_word_mono = time.monotonic()
-                    print(f"\n>>> PREDICTION: '{label}'  ({conf:.1%} confidence)", flush=True)
-                    print(f"    Session so far: {predictions}\n", flush=True)
-                    status_msg = f"Last: '{label}' ({conf:.0%})  |  n={len(predictions)}"
+                    if _llm_tts_locked:
+                        # Pipeline is mid-cycle — discard incoming input to
+                        # prevent command stacking and state contamination.
+                        print(
+                            f"[gate] INPUT DISCARDED (pipeline locked): '{label}'",
+                            flush=True,
+                        )
+                        status_msg = f"⟳ Processing… input '{label}' discarded"
+                    else:
+                        pending_groq_words.append(label)
+                        last_cnn_word_mono = time.monotonic()
+                        print(f"\n>>> PREDICTION: '{label}'  ({conf:.1%} confidence)", flush=True)
+                        print(f"    Session so far: {predictions}\n", flush=True)
+                        status_msg = f"Last: '{label}' ({conf:.0%})  |  n={len(predictions)}"
                     inferred_this_line = True
                 prev_pen_down = pen_down
                 if len(parts) == 6:
@@ -652,12 +700,26 @@ def main() -> None:
                     status_msg = "PEN UP  |  Press button to draw"
 
         idle_sec = max(0.1, float(GROQ_IDLE_SECONDS))
-        if pending_groq_words and not pen_down and last_cnn_word_mono is not None:
+        if _llm_tts_locked:
+            # Hard gate: suppress ALL idle-timer logic while a cycle is live.
+            # The status is already set by the locked branch above; just keep
+            # the HUD reflecting the locked state.
+            if status_msg and not status_msg.startswith("⟳"):
+                status_msg = "⟳ Processing… pipeline locked"
+        elif pending_groq_words and not pen_down and last_cnn_word_mono is not None:
             elapsed = time.monotonic() - last_cnn_word_mono
             if elapsed >= idle_sec:
-                sentence = flush_phrase_to_groq_and_tts(pending_groq_words[:])
-                pending_groq_words.clear()
-                last_cnn_word_mono = None
+                # Wrap pending_groq_words and last_cnn_word_mono in mutable
+                # containers so flush_phrase_to_groq_and_tts can hard-reset
+                # them from inside its finally block — guaranteed zero residual.
+                _mono_ref: list[float | None] = [last_cnn_word_mono]
+                sentence = flush_phrase_to_groq_and_tts(
+                    pending_groq_words[:],
+                    _pending_ref=pending_groq_words,
+                    _mono_ref=_mono_ref,
+                )
+                # Sync the local scalar from the reset container.
+                last_cnn_word_mono = _mono_ref[0]  # None after reset
                 if sentence:
                     last_sentence = sentence
                     sentence_display_until = time.monotonic() + 8.0  # show for 8 s
@@ -730,9 +792,13 @@ def main() -> None:
 
     ser.close()
     pygame.quit()
-    if pending_groq_words:
+    if pending_groq_words and not _llm_tts_locked:
         print("[infer] Flushing unfinished phrase before exit …", flush=True)
-        flush_phrase_to_groq_and_tts(pending_groq_words[:])  # speak on exit too
+        flush_phrase_to_groq_and_tts(
+            pending_groq_words[:],
+            _pending_ref=pending_groq_words,
+            _mono_ref=[last_cnn_word_mono],
+        )
     if predictions:
         print(f"\n[infer] Session CNN words ({len(predictions)}): {predictions}", flush=True)
     print("Bye!", flush=True)
