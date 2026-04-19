@@ -1,20 +1,3 @@
-"""
-AIRTALK – Air Writing + live inference
---------------------------------------
-Same serial + pygame loop as draw.py. When you release the pen button, the
-current canvas is preprocessed (bbox crop → 64×64) and classified with
-model_best.pt. Predictions print to the terminal and accumulate in a session list.
-
-After GROQ_IDLE_SECONDS with the pen up and no new word, accumulated words are
-sent to Groq (Llama) to form one natural sentence; that sentence is printed and
-spoken via Groq TTS (Orpheus). Set `GROQ_API_KEY` in a `.env` file next to this
-script, or export `GROQ_API_KEY` in the environment.
-
-Run:  python3 infer.py  [optional_serial_port]
-
-Controls match draw.py (C / R / S / +/- / brackets / ESC).
-"""
-
 from __future__ import annotations
 
 import glob
