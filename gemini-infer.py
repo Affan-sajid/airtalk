@@ -102,6 +102,22 @@ GEMINI_API_KEY_ENV = ("GEMINI_API_KEY",)
 
 _env_file_loaded = False
 
+# ── Phrase shortcut table ─────────────────────────────────────────────────────
+# Maps a tuple of lowercase CNN words (in the order you write them) to the
+# exact sentence that should be spoken — Gemini is skipped entirely for these.
+#
+# Key   : tuple of words exactly as the CNN outputs them (lowercase).
+# Value : the sentence to speak / display.
+#
+# Add as many entries as you like.  Matching is case-insensitive and ignores
+# leading/trailing whitespace on each token.
+PHRASE_SHORTCUTS: dict[frozenset[str], str] = {
+    frozenset({"affan", "name", "and", "this", "sidharth"}): "Hi, my name is Affan and this is Sidharth.",
+    # ── add more below ────────────────────────────────────────────────────────
+    # frozenset({"hi"}): "Hi there!",
+    # frozenset({"name", "affan"}): "My name is Affan.",
+}
+
 # ── LLM+TTS execution gate ───────────────────────────────────────────────────
 # When True the pipeline is mid-cycle.  ALL new inputs and idle-timer
 # triggers must be rejected until the cycle releases the lock.
@@ -244,6 +260,13 @@ def naturalize_with_gemini(words: list[str]) -> str | None:
     _load_project_env_file()
     if not words:
         return None
+
+    # ── Shortcut lookup (no API call) ────────────────────────────────────────
+    key = frozenset(w.strip().lower() for w in words)
+    if key in PHRASE_SHORTCUTS:
+        shortcut = PHRASE_SHORTCUTS[key]
+        print(f"[shortcut] Matched {key!r} → \"{shortcut}\"", flush=True)
+        return shortcut
     try:
         from google import genai
         from google.genai.types import HttpOptions, GenerateContentConfig
