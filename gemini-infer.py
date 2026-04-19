@@ -66,7 +66,7 @@ def find_port() -> str:
 
 # ── Serial / UI (same as draw.py) ────────────────────────────────────────────
 
-SERIAL_PORT = "/dev/cu.usbmodem2101"
+SERIAL_PORT = "/dev/cu.usbmodem1101"
 BAUD = 115200
 WIDTH, HEIGHT = 900, 650
 BG_COLOR = (15, 15, 20)
