@@ -81,7 +81,7 @@ def find_port() -> str:
 # ── Constants ────────────────────────────────────────────────────────────────
 
 # macOS: use /dev/cu.* for apps (not /dev/tty.*). Set to "" to auto-detect instead.
-SERIAL_PORT = "/dev/cu.usbmodem1101"
+SERIAL_PORT = ""
 
 BAUD        = 115200
 WIDTH, HEIGHT = 900, 650

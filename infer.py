@@ -116,11 +116,9 @@ GROQ_LLM_MODEL = "openai/gpt-oss-20b"
 GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
 GROQ_TTS_VOICE = "troy"
 # Optional override (prefer `.env` or the environment — do not commit real keys).
-GROQ_API_KEY = ""
 GROQ_API_KEY_ENV = ("GROQ_API_KEY",)
 
 _env_file_loaded = False
-
 
 def _load_project_env_file() -> None:
     """Load KEY=VALUE from `.env` in this directory; does not override existing os.environ."""
@@ -243,7 +241,7 @@ def predict_canvas(canvas_surface: pygame.Surface) -> tuple[str, float]:
 
 def _groq_api_key() -> str | None:
     _load_project_env_file()
-    file_key = str(GROQ_API_KEY).strip()
+    file_key = file_key = os.environ.get("GROQ_API_KEY_FILE", "").strip()
     if file_key:
         return file_key
     for name in GROQ_API_KEY_ENV:
@@ -270,7 +268,7 @@ def naturalize_with_groq(words: list[str]) -> str | None:
     except ImportError:
         print("[groq] Install: pip install groq", flush=True)
         return None
-    client = Groq(api_key="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")
+    client = Groq(api_key=key)
     joined = " ".join(words)
     prompt = f"""you are reconstructing a single intended sentence from a sequence of words detected from air-written input.
 
@@ -335,7 +333,7 @@ def speak_sentence(text: str) -> None:
     if key:
         try:
             from groq import Groq
-            client = Groq(api_key="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")
+            client = Groq(api_key=key)
             response = client.audio.speech.create(
                 model=GROQ_TTS_MODEL,
                 voice=GROQ_TTS_VOICE,
@@ -424,13 +422,15 @@ def main() -> None:
 
     try:
         font_big = pygame.font.SysFont("monospace", 18, bold=True)
-        font_hint = pygame.font.SysFont("monospace", 14)
-        font_sentence = pygame.font.SysFont("monospace", 26, bold=True)
+        font_hint = pygame.font.SysFont("monospace", 13)
+        font_sentence = pygame.font.SysFont("monospace", 32, bold=True)
+        font_words = pygame.font.SysFont("monospace", 28, bold=True)
     except (NotImplementedError, ImportError):
         print("[warn] pygame.font unavailable; HUD text disabled", flush=True)
         font_big = _DummyFont()
         font_hint = _DummyFont()
         font_sentence = _DummyFont()
+        font_words = _DummyFont()
 
     clock = pygame.time.Clock()
 
@@ -671,15 +671,24 @@ def main() -> None:
 
         screen.blit(canvas, (0, 0))
 
-        # ── Sentence overlay — show for 8 s after Groq returns ─────────────
         now = time.monotonic()
+
+        # ── Pending words strip — always visible at bottom ──────────────────
+        pygame.draw.rect(screen, (20, 20, 30), (0, HEIGHT - 54, WIDTH, 54))
+        if pending_groq_words:
+            words_text = "  ".join(pending_groq_words)
+            wsurf = font_words.render(words_text, True, (100, 200, 255))
+            screen.blit(wsurf, (WIDTH // 2 - wsurf.get_width() // 2, HEIGHT - 48))
+        elif predictions:
+            wsurf = font_words.render(" ".join(predictions[-6:]), True, (80, 80, 100))
+            screen.blit(wsurf, (WIDTH // 2 - wsurf.get_width() // 2, HEIGHT - 48))
+
+        # ── Sentence overlay — show for 10 s after Groq returns ────────────
         if last_sentence and now < sentence_display_until:
-            # Semi-transparent dark backdrop
-            overlay = pygame.Surface((WIDTH, 80), pygame.SRCALPHA)
-            overlay.fill((10, 10, 18, 210))
-            screen.blit(overlay, (0, HEIGHT // 2 - 40))
-            # Word-wrap if the sentence is long
-            max_chars = WIDTH // 16
+            overlay = pygame.Surface((WIDTH, 120), pygame.SRCALPHA)
+            overlay.fill((10, 10, 18, 230))
+            screen.blit(overlay, (0, HEIGHT // 2 - 60))
+            max_chars = max(1, WIDTH // 18)
             words_list = last_sentence.split()
             lines, line = [], ""
             for w in words_list:
@@ -691,25 +700,30 @@ def main() -> None:
                     line = w
             if line:
                 lines.append(line)
-            y_start = HEIGHT // 2 - (len(lines) * 30) // 2
+            y_start = HEIGHT // 2 - (len(lines) * 36) // 2
             for i, ln in enumerate(lines):
-                surf = font_sentence.render(ln, True, (80, 220, 160))
-                screen.blit(surf, (WIDTH // 2 - surf.get_width() // 2, y_start + i * 32))
+                surf = font_sentence.render(ln, True, (80, 240, 160))
+                screen.blit(surf, (WIDTH // 2 - surf.get_width() // 2, y_start + i * 38))
 
         cursor_color = CURSOR_DOWN if pen_down else CURSOR_UP
         pygame.draw.circle(screen, cursor_color, (int(cx), int(cy)), 8)
         pygame.draw.circle(screen, (255, 255, 255), (int(cx), int(cy)), 8, 1)
 
-        pygame.draw.rect(screen, (30, 30, 40), (0, 0, WIDTH, 36))
-        hud = font_big.render(status_msg, True, (220, 220, 220))
-        screen.blit(hud, (10, 8))
+        # ── Top HUD (status on left, hints on right, two rows) ─────────────
+        pygame.draw.rect(screen, (30, 30, 40), (0, 0, WIDTH, 54))
+        hud = font_big.render(status_msg[:80], True, (220, 220, 220))
+        screen.blit(hud, (10, 6))
         hints = font_hint.render(
-            f"release=word  pause{GROQ_IDLE_SECONDS:g}s=sentence  C=clear  R=reset  S=save  "
-            f"+/-=rot({scale})  [/]=trans({accel_gain:.0f})  ESC=quit",
+            f"release=word  pause{GROQ_IDLE_SECONDS:g}s=sentence  C=clear  R=recal  S=save  ESC=quit",
             True,
             (120, 120, 140),
         )
-        screen.blit(hints, (WIDTH - hints.get_width() - 10, 10))
+        screen.blit(hints, (10, 30))
+        scale_info = font_hint.render(
+            f"+/-=rot({scale})  [/]=trans({accel_gain:.0f})",
+            True, (100, 100, 120),
+        )
+        screen.blit(scale_info, (WIDTH - scale_info.get_width() - 10, 30))
 
         pygame.display.flip()
         clock.tick(120)
